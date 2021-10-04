@@ -1,0 +1,745 @@
+#+title: Transducers
+#+author: Henry Garner
+
+* Threading sequences
+
+ It's not uncommon to see this in Clojure code:
+
+ #+begin_src clojure
+   (defn result
+     [xs]
+     (->> xs
+	  (filter odd?)
+	  (map inc)
+	  (take 10)))
+ #+end_src
+
+ #+RESULTS:
+ : #'transducers.core/result
+
+ This code readability and generic sequence abstractions are one of the reasons Clojure is such a good language for working with data.
+
+* Hidden costs
+
+There is a price to pay for this elegance though: the code isn't efficient.
+
+#+begin_src clojure
+  (defn result
+    [xs]
+    (->> xs            ;; <- initial sequence
+	 (filter odd?) ;; <- new lazy sequence
+	 (map inc)     ;; <- new lazy sequence
+	 (take 10)))   ;; <- new lazy sequence
+#+end_src
+
+This isn't a problem for small sequences, but as sequences get larger, and if lots of lazy sequences get queued up for execution all at the end, memory and performance can become a problem.
+
+* Lack of flexibility
+
+#+begin_src clojure
+  (defn result
+    [chan]             ;; <- supply a channel type
+    (->> chan          ;; <- initial channel
+	 (filter odd?) ;; <- BOOM!
+	 (map inc)     ;; <-
+	 (take 10)))   ;; <-
+#+end_src
+
+The implementation is tied to lazy sequences when we chain operations in this way. This seems like an undesirable and unneccesary constraint.
+Why shouldn't we be able to express our algorithm independent of the specific collection abstraction?
+Maybe we want to switch from lazy sequences to queues or asynchronous channels. The logic ought to be portable to any sequence abstraction.
+
+* Let's invent transducers!
+
+How would we refactor the following to express our logic in a way which expresses the algorithm independent of the implementation?
+
+#+begin_src clojure
+  (def xs (range 10))
+
+  (->> xs
+       (filter odd?)
+       (map inc))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/xs |
+| (2 4 6 8 10)          |
+
+Obviously we have to rip out references to filter and map, because they only accept and return lazy sequences*
+
+*We're imagining transducers don't already exist
+
+* Reduce
+
+Reduce is appropriate whenever we have a sequence of things we want to turn into something else, one element at a time.
+
+#+begin_src clojure
+  (defn my-reduction-1 [xs]
+    (reduce (fn [acc x]
+	      (if (odd? x)
+		(conj acc (inc x))
+		acc))
+	    (vector) xs))
+
+  (my-reduction-1 (range 10))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-reduction-1 |
+| [2 4 6 8 10]                      |
+
+We've replaced references to map and filter with references to conj and vector instead. Vector provides the 'init' value and conj is our step function.
+
+* Substitution
+
+We can actually re-use conj instead of vector though. `conj` without arguments actually returns an empty vector.
+
+#+begin_src clojure
+  (defn my-reduction-2 [xs]
+    (reduce (fn [acc x]
+	      (if (odd? x)
+		(conj acc (inc x))
+		acc))
+	    (conj) xs))
+
+  (my-reduction-2 (range 10))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-reduction-2 |
+| [2 4 6 8 10]                      |
+
+Here `conj` does double duty. It's called once with no arguments to supply the init value, and once with two arguments to peform one step of the reduction.
+
+* Make generic
+
+Let's make conj a parameter so users can pass in their own function which can take the place of conj.
+
+#+begin_src clojure
+  (defn my-reduction-3 [f xs]
+    (reduce (fn [acc x]
+	      (if (odd? x)
+		(f acc (inc x))
+		acc))
+	    (f) xs))
+
+  (my-reduction-3 conj (range 10))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-reduction-3 |
+| [2 4 6 8 10]                      |
+
+Now we've defined something which expresses our algorithm in a way which is independent of the specific implementation.
+To prove it, we need functions of two arities, an init and a step.
+
+* Detour: arities!
+
+#+begin_src clojure
+  (defn how-many?
+    [& args]
+    (format "Called with %s args" (count args)))
+
+  (defn this-many
+    ([a] "Called with 1 arg")
+    ([a b] "Called with 2 args")
+    ([a b c] "Called with more args"))
+
+  (how-many? :a :b :c :d :e)
+  (this-many :a :b)
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/how-many? |
+| #'transducers.core/this-many |
+| "Called with 5 args"         |
+| "Called with 2 args"         |
+
+You can also have a zero-arity function (often called a thunk):
+
+#+begin_src clojure
+  (defn thunk
+    []
+    "Called with absolutely no arguments!")
+#+end_src
+
+** Monoids
+
+Lots of functions have a zero-arity case which returns a seed value and a 2 arity version which functions as a step function.
+
+#+begin_src clojure
+  (my-reduction-3 conj (range 10))
+
+  (my-reduction-3 + (range 10))
+
+  (my-reduction-3 * (range 10))
+
+  (my-reduction-3 str (range 10))
+#+end_src
+
+#+RESULTS:
+| [2 4 6 8 10] |
+|           30 |
+|         3840 |
+|     "246810" |
+
+** Bonus arity
+
+In addition to the init and step arities, many monoids also have a single-argument no-op version as well.
+
+#+begin_src clojure
+  (conj [1 2 3 4])
+
+  (+ 2)
+
+  (* 5)
+
+  (str "Hello world")
+#+end_src
+
+#+RESULTS:
+|     [1 2 3 4] |
+|             2 |
+|             5 |
+| "Hello world" |
+
+This is equivalent to the identity function. This seems unremarkable, but it's very useful as we'll see later on.
+
+* Taking stock
+
+I hope you agree we've expressed an algorithm in a generic way, and we only require people to supply a function of two arities (plus an optional third arity) to make use of it in different contexts.
+It's lacking a lot of elegance that we got from `map` and `filter` though. So let's see if we can add that back in.
+
+* Mapping
+
+In our reduction, mapping is the result of calling our step function *after* calling the function we're mapping on the element (`inc`).
+
+#+begin_src clojure
+  (defn my-reduction-3 [f xs]
+      (reduce (fn [accumulator x]
+	      (if (odd? x)
+		(f accumulator (inc x)) ;; <- call `inc` on value before calling the step function
+		accumulator))
+	      (f) xs))
+#+end_src
+
+Let's start by creating a function which wraps the desired behaviour of our reducing function.
+This is a wrapper which preserves the three arities of the wrapped reducing function and delegates to the reducing function in every case.
+
+#+begin_src clojure
+  (fn [rf]                 ;; <- the reducing function we're wrapping
+    (fn
+      ([] (rf))            ;; <- call the reducing function's init
+      ([acc x] (rf acc x)) ;; <- call the reducing function's step
+      ([acc] acc)))        ;; <- call the reducing function's complete
+#+end_src
+
+We don't appear to have achieved much by doing this but we have:
+we've given ourselves a place to insert our call to inc.
+
+#+begin_src clojure
+  (fn [rf]                       ;; <- the reducing function we're wrapping
+    (fn
+      ([] (rf))                  ;; <- call the reducing function's init
+      ([acc x] (rf acc (inc x))) ;; <- call `inc` before the reducing function's step
+      ([acc] acc)))              ;; <- call the reducing function's complete
+#+end_src
+
+** Mapping
+
+
+  We can make our reducing-function-wrapper more generic by replacing `inc` with a call to a function supplied as a parameter.
+  
+#+begin_src clojure
+    (defn mapper
+      [f]                          ;; <- the function we're mapping over the sequence
+      (fn [rf]                     ;; <- the reducing function we're wrapping
+	(fn
+	  ([] (rf))                ;; <- call the reducing function's init
+	  ([acc x] (rf acc (f x))) ;; <- call the reducing function's step _after_ transforming element with `f`
+	  ([acc] acc))))           ;; <- the no-op passthrough
+#+end_src
+
+We've called this function `mapper`.
+** Mapping
+
+
+#+begin_src clojure
+  (def my-mapper (mapper inc))
+
+  (def my-mapper* (my-mapper conj))
+
+  (my-mapper* [] 2)
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-mapper  |
+| #'transducers.core/my-mapper* |
+| [3]                           |
+
+#+begin_src clojure
+  (defn my-reduction-4 [f xs]
+    (reduce (fn [accumulator x]
+	      (if (odd? x)
+		(f accumulator x)  ;; <- no reference to `inc` any more
+		accumulator))
+	    (f) xs))
+
+  (my-reduction-4 my-mapper* (range 10))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-reduction-4 |
+| [2 4 6 8 10]                      |
+
+* Filtering
+
+In our reduction function, filtering is achieved with an if statement which decides whether to call the step function.
+
+#+begin_src clojure
+  (defn filterer
+    [pred]                                     ;; <- the function we're using to filter
+    (fn [rf]                                   ;; <- the reducing function we're wrapping
+      (fn
+	([] (rf))                              ;; <- call ths reducing function's init
+	([acc x] (if (pred x) (rf acc x) acc)) ;; <- call the reducing function's step if the predicate returns true
+	([acc] acc))))                         ;; <- the no-op passthrough
+#+end_src
+
+** Filtering
+
+#+begin_src clojure
+(def my-filterer (filterer odd?))
+
+(def my-filterer* (my-filterer conj))
+
+(defn my-reduction-5 [f xs]
+    (reduce (fn [accumulator x]
+              (f accumulator x)) ;; <- no reference to `if` any more
+            (f) xs))
+
+(my-reduction-5 my-filterer* (range 10))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-filterer    |
+| #'transducers.core/my-filterer*   |
+| #'transducers.core/my-reduction-5 |
+| [1 3 5 7 9]                       |
+
+So we've got mapping working and filtering working independently, how do we use them at the same time?
+* Function composition
+
+Composed functions are executed left to right.
+
+#+begin_src clojure
+  (def inc-string (comp str inc))
+
+(inc-string 4)
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/inc-string |
+| "5"                           |
+
+
+#+begin_src clojure
+  (def string-inc (comp inc str))
+
+  (string-inc 4)
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/string-inc      |
+| class java.lang.ClassCastException |
+
+  The first function can have n arguments but all subsequent composed functions must take 1 argument.
+  The argument to each function is the return value of the function to its right.
+
+
+** Function composition
+
+#+begin_src clojure
+  (defn mapper
+    [f]
+    (fn [rf]
+      (fn
+	([] (rf))
+	([acc x] (rf acc (f x)))
+	([acc] acc))))
+
+  (defn filterer
+    [f]
+    (fn [rf]
+      (fn
+	([] (rf))
+	([acc x] (if (f x) (rf acc x) acc))
+	([acc] acc))))
+#+end_src
+
+The innermost function accepts a monoid and returns a monoid (with the extra no-op arity we're ignoring for now).
+Informally, we should expect that these functions will compose. If functions had types, we'd say that the input and output types are the same.
+
+
+* Xform composition
+
+#+begin_src clojure
+  (def my-xform (comp my-filterer my-mapper))
+
+  ;; These are equivalent
+
+  (def my-xform (comp (filterer odd?) (mapper inc)))
+#+end_src
+
+#+RESULTS:
+| #'transducers.core/my-xform |
+| #'transducers.core/my-xform |
+
+Although function composition happens right to left, this means that the return value of mapper is passed to the return value of filterer.
+The return value of mapper is a function, and this is wrapped by the return from filterer.
+When the result of the composition, the outermost function, is finally invoked with an argument, the wrapping is reversed.
+The return from filterer is called first, then the return from mapper.
+
+#+begin_src clojure
+(my-reduction-5 my-xform (range 10))
+#+end_src
+
+#+RESULTS:
+
+** Xform composition
+
+  We have to supply a reducing function to specify the base init, step and complete functions.
+
+  #+begin_src clojure
+    (def my-xform* (my-xform conj))
+
+    (my-reduction-5 my-xform* (range 10))
+  #+end_src
+
+  #+RESULTS:
+  | #'transducers.core/my-xform* |
+  | [2 4 6 8 10]                 |
+
+* The finished reduction
+
+  It's a pain to remember to do this, so we can encapsulate this detail within our reduction.
+
+#+begin_src clojure
+  (defn my-reduction-6 [xform rf xs]
+    (let [f (xform rf)]              ;; <- we pass the reducing function to the xform
+      (f (reduce (fn [accumulator x] ;; <- we call `f` on the finished result
+		   (f accumulator x))
+		 (f) xs))))
+
+  (my-reduction-6 my-xform conj (range 10))
+
+  (my-reduction-6 my-xform + (range 10))
+#+end_src
+
+This is functionally equivalent to `transduce`.
+  
+#+begin_src clojure
+  (transduce my-xform conj (range 10))
+
+  (transduce (comp (filter odd?)
+		   (map inc))
+	     conj
+	     (range 10))
+#+end_src
+
+#+RESULTS:
+| [2 4 6 8 10] |
+| [2 4 6 8 10] |
+|
+So we've built our own versions of map, filter and reduce from scratch!
+* Other transducible contexts
+
+ Laziness is now dependent on the context. Our `reduce` version isn't lazy, `into` isn't lazy, but `sequence` is lazy.
+ No interim sequences, the output is fully realised one element at a time
+ The output type is separated from the algorithm. We could take the same transducer and use it for processing anything stream-like, whether or not the stream is finite
+  e.g. core.async
+
+#+begin_src clojure
+  ;; Lazy
+  (sequence my-xform (range 10))
+
+  ;; Not lazy
+  (into [] my-xform (range 10))
+
+  ;; Channel
+  (require '[clojure.core.async :as async])
+  (async/chan 1024 my-xform)
+#+end_src
+
+#+RESULTS:
+| (2 4 6 8 10)                                                                                                                         |
+| [2 4 6 8 10]                                                                                                                         |
+| #object[clojure.core.async.impl.channels.ManyToManyChannel 0x600f5d68 "clojure.core.async.impl.channels.ManyToManyChannel@600f5d68"] |
+
+* Transducers in our codebase
+
+  *Informant:* supply intel to agents https://github.com/elitltd/informant
+
+#+begin_src clojure
+  ;; (ns sandi.facebook.handlers
+  ;;  (:require [informant.core :refer [register]]))
+
+  (def informant-middleware
+    (filter (comp #{:init-app :page-view} :type)))
+
+  ;; (defmethod init-key :facebook
+  ;;   [key opts]
+  ;;   (register opts key informant-middleware
+  ;; 	      (fn [agent {:keys [type message]}]
+  ;; 		(handle-event type opts message))))
+
+  ;; (ns sandi.google.handlers
+  ;;  (:require [informant.core :refer [register]]))
+
+  (def informant-middleware
+    (filter (comp #{:page-view} :type)))
+
+  ;; (defmethod init-key :google
+  ;;   [key opts]
+  ;;   (register opts key informant-middleware
+  ;;             (fn [agent {:keys [type message]}]
+  ;;               (handle-event type opts message))))
+#+end_src
+
+#+RESULTS:
+| class java.io.FileNotFoundException            |
+| #'sandi.facebook.handlers/informant-middleware |
+| class java.io.FileNotFoundException            |
+| #'sandi.google.handlers/informant-middleware   |
+
+
+* Stateful transducers
+
+Won't talk much about these, but want to point out that some transducers need to keep state.
+Examples, `take`, `drop`, `partition-by`, `distinct`, etc.
+This is implemented with a bit of state maintained within the transducer itself (usually a volatile for performance, but could be an atom).
+
+#+begin_src clojure
+(defn take [n]
+  (fn [rf]
+    (let [nv (volatile! n)]
+      (fn
+        ([] (rf))
+        ([result] (rf result))
+        ([result input]
+         (let [n @nv
+               nn (vswap! nv dec)
+               result (if (pos? n)
+                        (rf result input)
+                        result)]
+           (if (not (pos? nn))
+             (ensure-reduced result)
+             result)))))))
+#+end_src
+
+This is very much like the local state held by some of our reagent components.
+Nothing else needs to know about it, so it's hidden within the scope of the transducer.
+
+We can also see a call to `ensure-reduced`, which is a way of indicating to the transducible context that we're done and should terminate.
+
+* Reducing functions
+
+When people talk about transducers they often stop there, but I think the reducing functions are at least as interesting.
+
+Transducers are generally a way of modifying a sequence of values before they are reduced into some compound value.
+The composition of transducers defines the way the sequence is modified, but the reducing function defines the compound value which is returned.
+
+We've seen how `conj`, `+`, `*` and `str` behave as reducing functions, but it's trivial to define our own.
+
+#+begin_src clojure
+(defn mean-1
+  ([] {:sum 0 :count 0})
+  ([acc x]
+   (-> acc
+       (update :sum + x)
+       (update :count inc)))
+  ([acc] acc))
+
+
+(transduce (map identity) mean-1 (range 10))
+#+end_src
+
+#+RESULTS:
+| #'sandi.google.handlers/mean-1 |
+| {:sum 45, :count 10}           |
+
+** The complete step
+
+  The complete step provides a way for reducing functions to clean up any intermediate state.
+  
+#+begin_src clojure
+  (defn mean-2
+    ([] {:sum 0 :count 0})
+    ([acc x]
+     (-> acc
+	 (update :sum + x)
+	 (update :count inc)))
+    ;; When the sequence is exhausted, divide the sum by the count
+    ([{:keys [sum count]}]
+     (/ sum count)))
+
+  (transduce (map identity) mean-2 (range 10))
+#+end_src
+
+#+RESULTS:
+| #'sandi.google.handlers/mean-2 |
+| 9/2                            |
+
+* Higher-order reducing functions
+
+  Reducing functions are just functions, so like transducers they can be composed.
+  They don't wrap each other, so we can't use `comp`, but they can be combined in other ways.
+
+  Juxt is a function that returns a function which executes `n` functions in parallel and returns `n` results.
+
+  #+begin_src clojure
+    (def my-juxt (juxt inc str odd?))
+
+    (my-juxt 4)
+  #+end_src
+
+  #+RESULTS:
+  | #'sandi.google.handlers/my-juxt |
+  | [5 "4" false]                   |
+
+  We can define a reducing function with the same semantics. Given `n` reducing functions, it can run each in parallel and return `n` results.
+  
+#+begin_src clojure
+    (defn juxt-rf
+      [& rfns]
+      (fn
+	([] (mapv (fn [f] (f)) rfns))                ;; <- init each rf
+	([acc x] (mapv (fn [f a] (f a x)) rfns acc)) ;; <- step each rf
+	([acc] (mapv (fn [f a] (f a)) rfns acc))))   ;; <- complete each rf
+
+    (transduce identity (juxt-rf conj + str mean-2) (range 10))
+#+end_src
+
+This is a slight oversimplification because we don't deal with the situation where 1 or more reducing functions returns a `reduced`, but this is not hard to add.
+
+#+RESULTS:
+| #'sandi.google.handlers/juxt-rf             |
+| [[0 1 2 3 4 5 6 7 8 9] 45 "0123456789" 9/2] |
+
+** Higher-order reducing functions
+
+  We can support named reducing functions quite easily by accepting a map of keys to reducing functions.
+  
+  We can delegate the hard work to our `juxt-rf` reducing function, and associate the keys with the results at the end.
+  This sort of thing can be made straightforward with helpers such as `post-complete` which accept a reducing function and a new complete step.
+  The new complete step is chained after the reducing function's complete step is run.
+
+#+begin_src clojure
+  (defn post-complete [rf f]
+    (fn
+      ([]      (rf))
+      ([acc]   (f (rf acc)))
+      ([acc x] (rf acc x))))
+
+  (defn fuse
+    [kvs]
+    (post-complete (apply juxt-rf (vals kvs))
+		   (fn [acc]
+		     (zipmap (keys kvs) acc))))
+
+  (transduce identity (fuse {:conj conj :plus +}) (range 10))
+#+end_src
+
+#+RESULTS:
+| #'sandi.google.handlers/post-complete   |
+| #'sandi.google.handlers/fuse            |
+| {:conj [0 1 2 3 4 5 6 7 8 9], :plus 45} |
+
+** Higher-order reducing functions
+
+  We can do something very similar with `pre-step` and wrap our reducing function with one which calls another function before each step.
+  
+  #+begin_src clojure
+    (defn pre-step [rf f]
+      (fn
+	([]      (rf))
+	([acc]   (rf acc))
+	([acc x] (rf acc (f x)))))
+
+    (defn facet [rf fns]
+      (->> (map (fn [f] (pre-step rf f)) fns)
+	   (apply juxt-rf)))
+
+   (transduce identity (facet + [:a :b]) [{:a 1 :b 2} {:a 3 :b 4}])
+  #+end_src
+
+  #+RESULTS:
+  | #'sandi.google.handlers/pre-step |
+  | #'sandi.google.handlers/facet    |
+  | [4 6]                            |
+
+  What's the difference between `pre-step` and `map`?
+* Further libraries
+
+   https://github.com/cgrand/xforms
+
+   In net.cgrand.xforms:
+
+regular ones: partition (1 arg), reductions, for, take-last, drop-last, sort, sort-by, wrap, window and window-by-time
+higher-order ones: by-key, into-by-key, multiplex, transjuxt, partition (2+ args), time
+aggregators: reduce, into, without, transjuxt, last, count, avg, sd, min, minimum, max, maximum, str
+In net.cgrand.xforms.io:
+
+sh to use any process as a reducible collection (of stdout lines) or as a transducers (input as stdin lines, stdout lines as output).
+Reducing functions
+
+in net.cgrand.xforms.rfs: min, minimum, max, maximum, str, str!, avg, sd, last and some.
+in net.cgrand.xforms.io: line-out and edn-out.
+(in net.cgrand.xforms)
+
+Transducing contexts:
+
+in net.cgrand.xforms: transjuxt (for performing several transductions in a single pass), iterator (clojure only), into, without, count, str (2 args) and some.
+in net.cgrand.xforms.io: line-out (3+ args) and edn-out (3+ args).
+in net.cgrand.xforms.nodejs.stream: transformer.
+
+   https://github.com/henrygarner/redux
+  
+
+** Kixi.stats
+  https://github.com/MastodonC/kixi.stats
+
+  A library of statistical reducing functions:
+- Count
+- Min
+- Max
+- Proportion
+- (Arithmetic) mean
+- Geometric mean
+- Harmonic mean
+- Median
+- Variance
+- Interquartile range
+- Standard deviation
+- Standard error
+- Skewness
+- Kurtosis
+- Covariance
+- Covariance matrix
+- Correlation
+- R-squared coefficient of determination
+- Adjusted R-squared
+- MSE / RMSE
+- Correlation matrix
+- Simple linear regression
+- Standard error of the mean
+- Standard error of the estimate
+- Standard error of the prediction
+- Simple Z-test & two-sample Z-test
+- Simple t-test and two-sample t-test
+- Chi-squared test
+
+  
+* Further libraries
+
+   
