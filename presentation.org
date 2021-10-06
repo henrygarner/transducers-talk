@@ -166,7 +166,7 @@ Lots of functions have a zero-arity case which returns a seed value and a 2 arit
 
 In addition to the init and step arities, many monoids also have a single-argument no-op version as well.
 
-#+begin_src clojure :results output :async
+#+begin_src clojure
   (conj [1 2 3 4])
 
   (+ 2)
@@ -288,7 +288,7 @@ So we've got mapping working and filtering working independently, how do we use 
 
 * Function composition
 
-Composed functions are executed left to right.
+Composed functions are executed right to left.
 
 #+begin_src clojure
   (def inc-string (comp str inc))
@@ -520,14 +520,17 @@ We've seen how `conj`, `+`, `*` and `str` behave as reducing functions, but it's
   We can define a reducing function with the same semantics. Given `n` reducing functions, it can run each in parallel and return `n` results.
   
 #+begin_src clojure
-    (defn juxt-rf
-      [& rfns]
-      (fn
-	([] (mapv (fn [f] (f)) rfns))                ;; <- init each rf
-	([acc x] (mapv (fn [f a] (f a x)) rfns acc)) ;; <- step each rf
-	([acc] (mapv (fn [f a] (f a)) rfns acc))))   ;; <- complete each rf
+  (defn juxt-rf
+    [& rfns]
+    (fn
+      ;; Init each rf
+      ([] (mapv (fn [f] (f)) rfns))
+      ;; Step each rf
+      ([acc x] (mapv (fn [f a] (f a x)) rfns acc))
+      ;; Complete each rf
+      ([acc] (mapv (fn [f a] (f a)) rfns acc))))
 
-    (transduce identity (juxt-rf conj + str mean-2) (range 10))
+  (transduce identity (juxt-rf conj + str mean-2) (range 10))
 #+end_src
 
 This is a slight oversimplification because we don't deal with the situation where 1 or more reducing functions returns a `reduced`, but this is not hard to add.
