@@ -6,6 +6,5 @@
   :dependencies [[org.clojure/clojure "1.10.0"]
                  [org.clojure/core.async "1.3.618"]
                  [redux "0.1.4"]
-                 [kixi/stats "0.5.4"]
-                 [elit/informant "0.0.4"]]
+                 [kixi/stats "0.5.4"]]
   :repl-options {:init-ns transducers.core})
